@@ -6,12 +6,13 @@ from shapely.geometry import Polygon, Point
 from shapely.errors import TopologicalError
 import numpy as np
 import math
+import sys
 
-# Stato globale
 previous_position = [0, 0, 0]
 first_navigation = True
 FRAME_ID = 'map'
 
+# ────────────── GEOMETRIA & SCANSIONE ──────────────
 def order_vertices_to_avoid_intersection(vertices):
     cx = sum(v[0] for v in vertices) / len(vertices)
     cy = sum(v[1] for v in vertices)
@@ -90,6 +91,7 @@ def optimize_path_layered_with_final_interleaved(row_points):
     optimized_path.extend(skipped_points)
     return optimized_path
 
+# ────────────── NAVIGAZIONE ──────────────
 def navigate_wait(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.2, hover_time=2.0, frame_id=FRAME_ID):
     global previous_position, first_navigation
 
@@ -111,7 +113,6 @@ def navigate_wait(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.2, hover_time=2.0, frame
         dist = np.linalg.norm(np.array([x, y, z]) - np.array(previous_position))
         previous_position = [x, y, z]
 
-        # attesa attiva con controllo distanza residua
         timeout = dist / speed + hover_time + 1.0
         start_time = rospy.get_time()
         while rospy.get_time() - start_time < timeout:
@@ -127,10 +128,21 @@ def navigate_wait(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.2, hover_time=2.0, frame
     except rospy.ServiceException as e:
         rospy.logerr(f"Errore nella navigazione: {e}")
 
+# ────────────── DECOLLO ──────────────
 def takeoff(altitude, speed, hover_time):
-    rospy.loginfo(f"[TAKEOFF] Decollo verticale fino a {altitude:.2f} metri...")
-    navigate_wait(x=0.0, y=0.0, z=altitude, speed=speed, hover_time=hover_time, frame_id='body')
+    rospy.wait_for_service('navigate')
+    navigate = rospy.ServiceProxy('navigate', srv.Navigate)
+    global first_navigation
+    rospy.loginfo(f"[TAKEOFF] Decollo a {altitude:.2f} m...")
+    try:
+        navigate(x=0.0, y=0.0, z=altitude, yaw=0.0, speed=speed, frame_id='body', auto_arm=first_navigation)
+        first_navigation = False
+        rospy.sleep(altitude / speed + hover_time)
+    except rospy.ServiceException as e:
+        rospy.logerr(f"Errore nel decollo: {e}")
+        safe_shutdown()
 
+# ────────────── INPUT & CALCOLI ──────────────
 def get_coordinates():
     print("Inserisci i 4 vertici (es: 4.0,3.0):")
     raw_vertices = []
@@ -156,59 +168,71 @@ def calcola_tempo_totale(percorso, velocita, hover, altitudine):
     tempo += len(percorso) * hover
     return tempo
 
+# ────────────── SHUTDOWN SICURO ──────────────
+def safe_shutdown():
+    if not rospy.is_shutdown():
+        try:
+            rospy.logwarn("Eseguo atterraggio di emergenza (shutdown)...")
+            rospy.wait_for_service('land', timeout=5)
+            land = rospy.ServiceProxy('land', Trigger)
+            land()
+            rospy.loginfo("Atterraggio completato con successo.")
+        except Exception as e:
+            rospy.logerr(f"Errore nell'atterraggio d'emergenza: {e}")
+    else:
+        rospy.logwarn("ROS è già in shutdown. Non posso eseguire atterraggio.")
+
+# ────────────── MAIN ──────────────
 def main():
     rospy.init_node('hex_flight')
+    rospy.on_shutdown(safe_shutdown)
 
     raw_vertices = get_coordinates()
-    raggio = float(input("Inserisci il raggio di scansione del drone (es: 1.0): "))
-    altitude = float(input("Inserisci altezza di volo (es: 2.0): "))
-    speed = float(input("Inserisci velocità di volo (es: 0.5): "))
-    hover_time = float(input("Inserisci tempo di stazionamento su ogni punto (es: 3.0): "))
+    raggio = float(input("Raggio di scansione (es: 1.0): "))
+    altitude = float(input("Altezza volo (es: 2.0): "))
+    speed = float(input("Velocità volo (es: 0.5): "))
+    hover_time = float(input("Tempo stazionamento (es: 3.0): "))
 
     ordered_vertices = order_vertices_to_avoid_intersection(raw_vertices)
     poligono = Polygon(ordered_vertices)
     if not poligono.is_valid:
-        print("[!] Poligono non valido. Correzione in corso...")
+        print("[!] Poligono non valido. Correzione...")
         poligono = Polygon(order_vertices_to_avoid_intersection(raw_vertices))
 
-    righe_punti, rimossi = generate_hex_grid_with_buffer_and_filter(poligono, raggio)
+    righe_punti, _ = generate_hex_grid_with_buffer_and_filter(poligono, raggio)
     percorso = optimize_path_layered_with_final_interleaved(righe_punti)
 
-    print(f"\nTotale punti nel percorso: {len(percorso)}")
-    for pt in percorso:
-        print(f"Muovo a: ({pt[0]:.2f}, {pt[1]:.2f})")
-
     tempo_totale = calcola_tempo_totale(percorso, speed, hover_time, altitude)
-    print(f"\nTempo totale stimato per completare la missione: {tempo_totale:.1f} secondi\n")
+    print(f"Totale punti: {len(percorso)} - Durata stimata: {tempo_totale:.1f} s\n")
 
-    takeoff(altitude, speed, hover_time)
-
-    for x, y in percorso:
-        rospy.loginfo(f"[MISSIONE] Navigazione verso: ({x:.2f}, {y:.2f}, {altitude:.2f})")
-        navigate_wait(x=x, y=y, z=altitude, speed=speed, hover_time=hover_time)
-
-    print("[RITORNO] Torno al punto iniziale...")
-    navigate_wait(x=0.0, y=0.0, z=altitude, speed=speed, hover_time=hover_time)
-
-    rospy.wait_for_service('land')
     try:
-        land = rospy.ServiceProxy('land', Trigger)
-        land()
-        rospy.loginfo("Atterraggio eseguito.")
-    except rospy.ServiceException as e:
-        rospy.logerr(f"Errore nell'atterraggio: {e}")
+        takeoff(altitude, speed, hover_time)
 
-    # Rilascio OFFBOARD
-    rospy.wait_for_service('simple_offboard/release')
-    try:
-        release = rospy.ServiceProxy('simple_offboard/release', Trigger)
-        release()
-        rospy.loginfo("Controllo OFFBOARD rilasciato.")
-    except rospy.ServiceException:
-        rospy.logwarn("Errore nel rilascio del controllo OFFBOARD.")
+        for x, y in percorso:
+            if rospy.is_shutdown():
+                break
+            navigate_wait(x=x, y=y, z=altitude, speed=speed, hover_time=hover_time)
+
+        if not rospy.is_shutdown():
+            navigate_wait(x=0.0, y=0.0, z=altitude, speed=speed, hover_time=hover_time)
+
+            rospy.wait_for_service('land')
+            land = rospy.ServiceProxy('land', Trigger)
+            land()
+            rospy.loginfo("Atterraggio finale completato.")
+
+            rospy.wait_for_service('simple_offboard/release')
+            release = rospy.ServiceProxy('simple_offboard/release', Trigger)
+            release()
+            rospy.loginfo("Controllo OFFBOARD rilasciato.")
+
+    finally:
+        safe_shutdown()
 
 if __name__ == "__main__":
     try:
         main()
     except rospy.ROSInterruptException:
-        pass
+        rospy.logwarn("Script interrotto da ROS. Tentativo di atterraggio...")
+        safe_shutdown()
+        pass  # sopprime l'eccezione, non mostra stack trace
