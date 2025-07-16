@@ -6,3 +6,11 @@ Lo script richiede all'utente di inserire le coordinate di 4 vertici per identif
 
 NOTA!
 Il drone Coex Clover 4 utilizza come riferimento per il sistema di coordinate la posizione iniziale dove viene acceso (coordinate x=0, y=0, z=0).
+
+Comandi:
+-inserire i valori delle coordinate (es. 2.0,3.0)
+-inserire il raggio di scansione (es. 1.0)
+-inserire l'altezza di volo (es. 2.0)
+-inserire la velocità di volo (es. 0.3)
+-inserire il tempo di stazionameto per ogni punto (es. 2.0)
+-atterraggio di emergenza Ctrl+c
