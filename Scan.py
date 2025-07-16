@@ -7,9 +7,10 @@ from shapely.errors import TopologicalError
 import numpy as np
 import math
 
-# Stato persistente tra chiamate
+# Stato globale
 previous_position = [0, 0, 0]
 first_navigation = True
+FRAME_ID = 'map'
 
 def order_vertices_to_avoid_intersection(vertices):
     cx = sum(v[0] for v in vertices) / len(vertices)
@@ -89,9 +90,12 @@ def optimize_path_layered_with_final_interleaved(row_points):
     optimized_path.extend(skipped_points)
     return optimized_path
 
-def navigate_wait(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.2, hover_time=2.0, frame_id='map'):
+def navigate_wait(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.2, hover_time=2.0, frame_id=FRAME_ID):
     global previous_position, first_navigation
+
     rospy.wait_for_service('navigate')
+    rospy.wait_for_service('get_telemetry')
+
     navigate = rospy.ServiceProxy('navigate', srv.Navigate)
     get_telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
 
@@ -103,18 +107,28 @@ def navigate_wait(x=0.0, y=0.0, z=0.0, yaw=0.0, speed=0.2, hover_time=2.0, frame
         )
         first_navigation = False
 
+        rospy.loginfo(f"[NAVIGATE] Muovo a ({x:.2f}, {y:.2f}, {z:.2f}) a {speed:.2f} m/s")
         dist = np.linalg.norm(np.array([x, y, z]) - np.array(previous_position))
-        rospy.sleep(dist / speed + hover_time + 1.0)
         previous_position = [x, y, z]
 
-        telem = get_telemetry(frame_id='map')
+        # attesa attiva con controllo distanza residua
+        timeout = dist / speed + hover_time + 1.0
+        start_time = rospy.get_time()
+        while rospy.get_time() - start_time < timeout:
+            telem = get_telemetry(frame_id=frame_id)
+            err = np.linalg.norm(np.array([telem.x, telem.y, telem.z]) - np.array([x, y, z]))
+            if err < 0.15:
+                break
+            rospy.sleep(0.3)
+
+        telem = get_telemetry(frame_id=frame_id)
         rospy.loginfo(f"[Telemetry] Posizione: ({telem.x:.2f}, {telem.y:.2f}, {telem.z:.2f}) Modalità: {telem.mode}")
         return res
     except rospy.ServiceException as e:
         rospy.logerr(f"Errore nella navigazione: {e}")
 
 def takeoff(altitude, speed, hover_time):
-    rospy.loginfo(f"Decollo verticale fino a {altitude:.2f} metri...")
+    rospy.loginfo(f"[TAKEOFF] Decollo verticale fino a {altitude:.2f} metri...")
     navigate_wait(x=0.0, y=0.0, z=altitude, speed=speed, hover_time=hover_time, frame_id='body')
 
 def get_coordinates():
@@ -170,10 +184,10 @@ def main():
     takeoff(altitude, speed, hover_time)
 
     for x, y in percorso:
-        rospy.loginfo(f"Navigazione verso: ({x:.2f}, {y:.2f}, {altitude})")
+        rospy.loginfo(f"[MISSIONE] Navigazione verso: ({x:.2f}, {y:.2f}, {altitude:.2f})")
         navigate_wait(x=x, y=y, z=altitude, speed=speed, hover_time=hover_time)
 
-    print("Ritorno al punto iniziale...")
+    print("[RITORNO] Torno al punto iniziale...")
     navigate_wait(x=0.0, y=0.0, z=altitude, speed=speed, hover_time=hover_time)
 
     rospy.wait_for_service('land')
@@ -183,6 +197,15 @@ def main():
         rospy.loginfo("Atterraggio eseguito.")
     except rospy.ServiceException as e:
         rospy.logerr(f"Errore nell'atterraggio: {e}")
+
+    # Rilascio OFFBOARD
+    rospy.wait_for_service('simple_offboard/release')
+    try:
+        release = rospy.ServiceProxy('simple_offboard/release', Trigger)
+        release()
+        rospy.loginfo("Controllo OFFBOARD rilasciato.")
+    except rospy.ServiceException:
+        rospy.logwarn("Errore nel rilascio del controllo OFFBOARD.")
 
 if __name__ == "__main__":
     try:
